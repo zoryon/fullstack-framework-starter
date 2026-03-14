@@ -1,0 +1,36 @@
+.git
+.gitignore
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Docs and local metadata
+docs/
+.vscode/
+
+# Logs and temp
+*.log
+logs/
+tmp/
+
+# Node artifacts
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/coverage/
+
+# Go artifacts
+**/bin/
+**/*.out
+**/*.test
+
+# Python artifacts (for tooling)
+**/__pycache__/
+**/*.pyc
+**/.venv/
+
+# Docker generated / runtime artifacts
+deploy/traefik/acme.json

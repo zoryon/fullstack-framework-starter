@@ -1,0 +1,19 @@
+.git
+.gitignore
+.dockerignore
+
+# Runtime-generated certificate file (if used as bind mount)
+traefik/acme.json
+
+# Local env files in deploy folder
+.env
+.env.*
+
+# Logs / temp
+*.log
+tmp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

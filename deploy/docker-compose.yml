@@ -1,0 +1,410 @@
+# ==============================================================================
+# Nutrico SaaS — Docker Compose
+# File: deploy/docker-compose.yml
+#
+# Services:
+#   traefik     — reverse proxy, TLS termination (Let's Encrypt)
+#   ui          — Next.js 16 frontend (:3000)
+#   api         — Go REST API (:8080)
+#   worker      — Go Asynq worker (same image as api, -mode worker)
+#   postgres    — PostgreSQL 16 (primary data store)
+#   pgadmin     — PostgreSQL admin UI (:5050)
+#   redis-cache — Redis 7 volatile (sessions, tokens, no persistence)
+#   redis-queue — Redis 7 AOF (sessions + Asynq queue broker)
+#   asynqmon    — Asynq queue monitor UI (:8081, dev profile only)
+#
+# Usage:
+#   Dev:  docker compose --profile dev up --build
+#   Prod: docker compose up --build -d
+#
+# All secrets come from a .env file at the repo root (never committed).
+# Copy .env.example → .env and fill in the values before first run.
+# ==============================================================================
+
+name: nutrico
+
+# ------------------------------------------------------------------------------
+# Networks
+# ------------------------------------------------------------------------------
+networks:
+  proxy:
+    # Traefik sits on this network and routes inbound traffic to web + api.
+    external: false
+  internal:
+    # Backend services (api, worker, postgres, redis) talk here.
+    # Traefik has no access to this network — defence in depth.
+    external: false
+
+# ------------------------------------------------------------------------------
+# Volumes
+# ------------------------------------------------------------------------------
+volumes:
+  pgadmin-data:
+    # pgAdmin server state (saved servers, preferences, session data).
+  redisdata-queue:
+    # Redis AOF persistence for the durable queue. Survives container restarts.
+  traefik-acme:
+    # Let's Encrypt certificate storage. Must persist across Traefik restarts
+    # or the ACME rate limits will bite you in production.
+
+# ------------------------------------------------------------------------------
+# Services
+# ------------------------------------------------------------------------------
+services:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # TRAEFIK — reverse proxy + TLS
+  # ────────────────────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3
+    container_name: nutrico-traefik
+    restart: unless-stopped
+    networks:
+      - proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Static config (entrypoints, providers, ACME resolver)
+      - ./traefik/traefik.yml:/traefik.yml:ro
+      # Let's Encrypt certs — must be writable by Traefik
+      - traefik-acme:/acme
+      # Docker socket so Traefik can read container labels
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Used by the ACME DNS challenge if you switch from HTTP to DNS challenge.
+      # Leave empty for the default HTTP-01 challenge.
+      - TZ=${TZ:-UTC}
+    labels:
+      - "traefik.enable=true"
+      # Redirect all HTTP → HTTPS
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # UI — Next.js 16 frontend
+  # ────────────────────────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: ../apps/client
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+    container_name: nutrico-ui
+    restart: unless-stopped
+    networks:
+      - proxy
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=${APP_ENV:-production}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      - APP_ENV=${APP_ENV:-production}
+    depends_on:
+      api:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.web.entrypoints=websecure"
+      - "traefik.http.routers.web.tls=true"
+      - "traefik.http.routers.web.tls.certresolver=letsencrypt"
+      - "traefik.http.services.web.loadbalancer.server.port=3000"
+      # Security headers middleware applied to all web responses
+      - "traefik.http.routers.web.middlewares=security-headers"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # API — Go REST API
+  # ────────────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ../apps/server
+      dockerfile: Dockerfile
+      target: production
+    container_name: nutrico-api
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    ports:
+      # Local host access only (not exposed externally).
+      - "127.0.0.1:8080:8080"
+    expose:
+      - "8080"
+    entrypoint: ["./app", "-mode", "api"]
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-nutrico}
+      - POSTGRES_APP_DB_USER=${POSTGRES_APP_DB_USER:-nutrico_user}
+      - POSTGRES_APP_DB_PASSWORD=${POSTGRES_APP_DB_PASSWORD:-localdev}
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-disable}
+      - REDIS_CACHE_URL=redis://:${REDIS_CACHE_PASSWORD:-cache-dev-password}@redis-cache:6379
+      - REDIS_QUEUE_URL=redis://:${REDIS_QUEUE_PASSWORD:-queue-dev-password}@redis-queue:6379
+      - JWT_SECRET=${JWT_SECRET}
+      - REFRESH_TOKEN_SECRET=${REFRESH_TOKEN_SECRET}
+      - BCRYPT_COST=${BCRYPT_COST:-12}
+      - BASE_URL=${BASE_URL}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - SMTP_FROM=${SMTP_FROM}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - EWMA_ALPHA=${EWMA_ALPHA:-0.3}
+      - INVOICE_UPLOAD_MAX_MB=${INVOICE_UPLOAD_MAX_MB:-10}
+      - INVOICE_UPLOAD_MAX_FILES=${INVOICE_UPLOAD_MAX_FILES:-20}
+      - METRICS_ENABLED=${METRICS_ENABLED:-true}
+      - METRICS_PATH=${METRICS_PATH:-/metrics}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      # /api/* routes to the Go API — higher priority than the client catch-all
+      - "traefik.http.routers.api.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.api.priority=10"
+      - "traefik.http.services.api.loadbalancer.server.port=8080"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # WORKER — Go Asynq worker (same image as api)
+  # ────────────────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ../apps/server
+      dockerfile: Dockerfile
+      target: production
+    container_name: nutrico-worker
+    restart: unless-stopped
+    networks:
+      - internal
+    # No exposed ports — the worker has no HTTP server
+    entrypoint: ["./app", "-mode", "worker"]
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-nutrico}
+      - POSTGRES_APP_DB_USER=${POSTGRES_APP_DB_USER:-nutrico_user}
+      - POSTGRES_APP_DB_PASSWORD=${POSTGRES_APP_DB_PASSWORD:-localdev}
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-disable}
+      - REDIS_CACHE_URL=redis://:${REDIS_CACHE_PASSWORD:-cache-dev-password}@redis-cache:6379
+      - REDIS_QUEUE_URL=redis://:${REDIS_QUEUE_PASSWORD:-queue-dev-password}@redis-queue:6379
+      - ASYNQ_CONCURRENCY=${ASYNQ_CONCURRENCY:-10}
+      - EWMA_ALPHA=${EWMA_ALPHA:-0.3}
+      # Stripe needed for billing event processing in worker tasks
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      # Email
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - EMAIL_FROM=${EMAIL_FROM}
+      - BASE_URL=${BASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # POSTGRES — PostgreSQL 16
+  # ────────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: nutrico-postgres
+    restart: unless-stopped
+    networks:
+      - internal
+    # No port exposed to host in production.
+    # For local dev inspection: uncomment the line below.
+    # ports:
+    #   - "${POSTGRES_HOST_PORT:-5432}:${POSTGRES_PORT:-5432}"
+    volumes:
+      # Persistent data directory on host disk (set in .env)
+      - type: bind
+        source: ${POSTGRES_DATA_PATH:-../.data/postgres}
+        target: /var/lib/postgresql/data
+      # Init scripts: executed once on first boot (empty pgdata volume).
+      # Files run in alphabetical order — schema before roles.
+      - ./postgres/01-main-schema.sql:/docker-entrypoint-initdb.d/01-main-schema.sql:ro
+      - ./postgres/02-roles.sql:/docker-entrypoint-initdb.d/02-roles.sql:ro
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-nutrico}
+      - POSTGRES_USER=${POSTGRES_SUPERUSER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # Tune shared_buffers and work_mem for a small VPS.
+      # Adjust based on available RAM.
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    command: >
+      postgres
+        -c port=${POSTGRES_PORT:-5432}
+        -c shared_buffers=256MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=128MB
+        -c effective_cache_size=512MB
+        -c wal_level=replica
+        -c max_connections=100
+        -c log_min_duration_statement=500
+        -c log_line_prefix='%t [%p] %u@%d '
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-nutrico} -p ${POSTGRES_PORT:-5432}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # PGADMIN — PostgreSQL administration UI
+  # ────────────────────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:9.13
+    container_name: nutrico-pgadmin
+    restart: unless-stopped
+    networks:
+      - internal
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD:-change-me-pgadmin}
+      - PGADMIN_LISTEN_PORT=80
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # REDIS CACHE — volatile, no persistence
+  # Stores: JWT sessions, magic link tokens, email verification tokens,
+  #         password reset tokens.
+  # If this instance restarts, users are logged out and must re-authenticate.
+  # That is intentional and acceptable.
+  # ────────────────────────────────────────────────────────────────────────────
+  redis-cache:
+    image: redis:7-alpine
+    container_name: nutrico-redis-cache
+    restart: unless-stopped
+    networks:
+      - internal
+    # No volume — volatile by design, no persistence
+    command: >
+      redis-server
+        --save ""
+        --appendonly no
+        --requirepass ${REDIS_CACHE_PASSWORD:-cache-dev-password}
+        --maxmemory 128mb
+        --maxmemory-policy allkeys-lru
+        --loglevel notice
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_CACHE_PASSWORD:-cache-dev-password} ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+ 
+  # ────────────────────────────────────────────────────────────────────────────
+  # REDIS QUEUE — AOF durable, noeviction
+  # Stores: Asynq task queue and scheduled jobs.
+  # noeviction is mandatory — tasks must never be silently dropped.
+  # ────────────────────────────────────────────────────────────────────────────
+  redis-queue:
+    image: redis:7-alpine
+    container_name: nutrico-redis-queue
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - redisdata-queue:/data
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --requirepass ${REDIS_QUEUE_PASSWORD:-queue-dev-password}
+        --maxmemory-policy noeviction
+        --save 60 1
+        --loglevel notice
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_QUEUE_PASSWORD:-queue-dev-password} ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # ASYNQMON — Asynq queue monitor (dev profile only)
+  # ────────────────────────────────────────────────────────────────────────────
+  asynqmon:
+    image: hibiken/asynqmon:latest
+    container_name: nutrico-asynqmon
+    profiles:
+      - dev
+    restart: unless-stopped
+    networks:
+      - internal
+      - proxy
+    expose:
+      - "8081"
+    environment:
+      - REDIS_ADDR=redis-queue:6379
+      - REDIS_PASSWORD=${REDIS_QUEUE_PASSWORD:-queue-dev-password}
+    depends_on:
+      redis-queue:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.asynqmon.rule=Host(`queue.${APP_DOMAIN}`)"
+      - "traefik.http.routers.asynqmon.entrypoints=websecure"
+      - "traefik.http.routers.asynqmon.tls=true"
+      - "traefik.http.routers.asynqmon.tls.certresolver=letsencrypt"
+      - "traefik.http.services.asynqmon.loadbalancer.server.port=8081"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # PROMETHEUS — lightweight metrics (optional profile)
+  # Starts only with --profile monitoring to avoid unnecessary local load.
+  # ────────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: nutrico-prometheus
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    networks:
+      - internal
+    ports:
+      - "127.0.0.1:9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=24h"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      api:
+        condition: service_healthy

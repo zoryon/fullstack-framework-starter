@@ -1,0 +1,25 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+docs/
+**/*.md
+**/*.log
+
+# Local env files
+.env
+.env.*
+
+# Build outputs / caches
+bin/
+tmp/
+dist/
+coverage/
+*.out
+*.test
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
